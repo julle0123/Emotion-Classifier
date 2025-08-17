@@ -1,0 +1,163 @@
+# -*- coding: utf-8 -*-
+"""
+Trainer 기반 최종 파인튜닝 스크립트
+- 입력(필수): /data/emotion_tagged_conversations_pred.json
+  포맷: [{"id","user_input","bot_response","emotion"}]  # emotion = 의사라벨
+
+주요 세팅
+- 모델: 기본 KLUE/roberta-base (장문/미묘한 문맥 강점). KcELECTRA로 바꾸려면 MODEL_NAME만 수정
+- NFKC 정규화, MAX_LEN=224, Label Smoothing=0.05
+- EarlyStopping(patience=2), best 모델 자동 로드
+
+"""
+import os, json, unicodedata as ud
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+
+import torch
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    TrainingArguments, Trainer, EarlyStoppingCallback, set_seed,
+)
+
+# ===== 경로/라벨 =====
+DATA_DIR = "data"
+PSEUDO_JSON = os.path.join(DATA_DIR, "emotion_tagged_conversations_pred.json")
+GOLDEN_JSON = os.path.join(DATA_DIR, "golden_sample_filtered.json")  # 있으면 test용 평가
+OUT_DIR = os.path.join(DATA_DIR, "outputs_trainer_final2")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+LABELS = ['분노','불안','슬픔','평온','당황','기쁨']
+label2id = {k:i for i,k in enumerate(LABELS)}
+id2label = {v:k for k,v in label2id.items()}
+
+# ===== 설정 =====
+SEED = 42
+set_seed(SEED)
+MODEL_NAME = "klue/roberta-base"   # ← 필요시 "beomi/KcELECTRA-base-v2022"
+MAX_LEN = 224
+LR = 2e-5
+TRAIN_EPOCHS = 6          # 의사라벨 노이즈 고려(5~6 권장)
+BATCH_TRAIN = 32
+BATCH_EVAL = 64
+WARMUP_RATIO = 0.05
+WEIGHT_DECAY = 0.01
+LABEL_SMOOTHING = 0.05
+PATIENCE = 2
+
+# ===== 데이터 로드 & 분할 =====
+with open(PSEUDO_JSON, 'r', encoding='utf-8') as f:
+    rows = json.load(f)
+
+df = pd.DataFrame(rows)
+assert {'user_input','emotion'}.issubset(df.columns), "JSON must have user_input & emotion"
+
+def nfkc_keep(s: str) -> str: return ud.normalize('NFKC', str(s))
+
+df = df[['user_input','emotion']].rename(columns={'user_input':'text','emotion':'label'}).copy()
+df['text'] = df['text'].astype(str).map(nfkc_keep)
+df = df[df['label'].isin(LABELS)].reset_index(drop=True)
+df['label'] = df['label'].map(label2id)
+
+# 90/10 stratified split
+train_df, val_df = train_test_split(df, test_size=0.10, random_state=SEED, stratify=df['label'])
+print(f"[Split] train={len(train_df):,} val={len(val_df):,}")
+
+# ===== Dataset 변환 =====
+raw_train = Dataset.from_pandas(train_df.reset_index(drop=True))
+raw_val   = Dataset.from_pandas(val_df.reset_index(drop=True))
+
+# ===== Tokenizer / 전처리 =====
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+def preprocess_func(batch):
+    enc = tokenizer(
+        batch['text'],
+        truncation=True,
+        padding='max_length',
+        max_length=MAX_LEN,
+    )
+    enc['labels'] = batch['label']
+    return enc
+
+train_ds = raw_train.map(preprocess_func, batched=True, remove_columns=raw_train.column_names)
+val_ds   = raw_val.map(preprocess_func,   batched=True, remove_columns=raw_val.column_names)
+
+# ===== 모델 =====
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=len(LABELS),
+    id2label=id2label,
+    label2id=label2id,
+)
+
+# ===== 평가지표 =====
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {
+        'accuracy': accuracy_score(labels, preds),
+        'macro_f1': f1_score(labels, preds, average='macro'),
+        'weighted_f1': f1_score(labels, preds, average='weighted'),
+    }
+
+# ===== 학습 인자 =====
+args = TrainingArguments(
+    output_dir=OUT_DIR,
+    per_device_train_batch_size=BATCH_TRAIN,
+    per_device_eval_batch_size=BATCH_EVAL,
+    num_train_epochs=TRAIN_EPOCHS,
+    learning_rate=LR,
+    warmup_ratio=WARMUP_RATIO,
+    weight_decay=WEIGHT_DECAY,
+    bf16=torch.cuda.is_available(),    
+    logging_steps=100,
+    eval_strategy='epoch',
+    save_strategy='epoch',
+    save_total_limit=2,
+    load_best_model_at_end=True,
+    metric_for_best_model='macro_f1',
+    greater_is_better=True,
+    label_smoothing_factor=LABEL_SMOOTHING,
+    report_to='none',                 # wandb 등 미사용
+)
+
+# ===== Trainer (필요시 class weights 적용하려면 compute_loss 오버라이드 가능) =====
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=PATIENCE)],
+)
+
+# ===== 학습 =====
+trainer.train()
+
+# ===== 저장 =====
+best_dir = os.path.join(OUT_DIR, 'best_model')
+trainer.save_model(best_dir)
+tokenizer.save_pretrained(best_dir)
+print(f"\n Saved best model to: {best_dir}")
+
+# ===== (옵션) 골든셋 테스트 =====
+if os.path.exists(GOLDEN_JSON):
+    with open(GOLDEN_JSON, 'r', encoding='utf-8') as f:
+        gold = json.load(f)
+    gdf = pd.DataFrame(gold)[['user_input','emotion']].rename(columns={'user_input':'text','emotion':'label'})
+    gdf = gdf[gdf['label'].isin(LABELS)].reset_index(drop=True)
+    gdf['label'] = gdf['label'].map(label2id)
+    graw = Dataset.from_pandas(gdf)
+    gset = graw.map(preprocess_func, batched=True, remove_columns=graw.column_names)
+    eval_res = trainer.evaluate(eval_dataset=gset)
+    print("\n📊 GOLDEN Test Results:")
+    for k, v in eval_res.items():
+        if isinstance(v, float): print(f"{k}: {v:.6f}")
+        else: print(k, v)
