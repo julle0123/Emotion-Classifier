@@ -1,0 +1,205 @@
+# -*- coding: utf-8 -*-
+"""
+24만 문장 의사라벨링(감정 재분류) — inference 전용 스크립트
+- 입력(JSON/JSONL 모두 지원): /content/drive/MyDrive/감정분류/data/emotion_tagged_conversations.json
+    각 항목 예:
+    {
+      "id": "30",
+      "vector": [0.0],
+      "payload": {
+         "user_input": "...",
+         "bot_response": "...",
+         "emotion": "불안"
+      }
+    }
+- 사용 텍스트: payload.user_input  (bot_response는 사용하지 않음)
+- 출력: 동일 구조에 pred_emotion, pred_conf 추가
+  - /content/drive/MyDrive/감정분류/data/emotion_tagged_conversations_pred.json
+  - /content/drive/MyDrive/감정분류/data/emotion_tagged_conversations_pred.csv (요약)
+- 선택: 신뢰도/마진 필터링된 high-confidence 샘플만 별도 저장
+  - *_filtered.json / *_filtered.csv
+
+Colab 준비 예시:
+# from google.colab import drive; drive.mount('/content/drive')
+# %pip install -q transformers accelerate datasets
+"""
+import os, json, sys, math, unicodedata as ud
+from typing import Iterable, Dict, Any
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from tqdm.auto import tqdm
+
+# ===== 경로/설정 =====
+DATA_DIR = "data"
+INPUT_PATH = os.path.join(DATA_DIR, "emotion_tagged_conversations.json")
+# 학습된 best 모델 경로(필요시 교체)
+MODEL_DIR = os.path.join(DATA_DIR, "outputs_step1_kcelectra_SIMPLE", "best_model")
+# MODEL_DIR = os.path.join(DATA_DIR, "outputs_step1_kcelectra_torch", "best_model")  # 이전 베이스라인 사용시
+
+OUTPUT_JSON = os.path.join(DATA_DIR, "emotion_tagged_conversations_pred.json")
+OUTPUT_CSV  = os.path.join(DATA_DIR, "emotion_tagged_conversations_pred.csv")
+OUTPUT_JSON_F = os.path.join(DATA_DIR, "emotion_tagged_conversations_pred_filtered.json")
+OUTPUT_CSV_F  = os.path.join(DATA_DIR, "emotion_tagged_conversations_pred_filtered.csv")
+
+LABELS = ['분노','불안','슬픔','평온','당황','기쁨']  # 학습 시 사용한 순서
+MAX_LEN = 224
+BATCH = 256  # A100이면 256~512도 가능(메모리 보고 조절)
+USE_BOT_RESPONSE = False  # 항상 False: 감정은 user_input 기준
+
+# (옵션) 필터링 기준 — 안전 시작값
+APPLY_FILTER = True
+AGREE_MARGIN = 0.20   # p_max - p_second >= 0.20
+CONF_THRES = 0.75     # p_max >= 0.75 (클래스 공통)
+
+# ===== 유틸: JSON/JSONL 로더 =====
+def _is_jsonl(path: str) -> bool:
+    return path.lower().endswith('.jsonl') or path.lower().endswith('.ndjson')
+
+def load_items(path: str) -> Iterable[Dict[str, Any]]:
+    if _is_jsonl(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line=line.strip()
+                if not line: continue
+                yield json.loads(line)
+    else:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # 배열 또는 dict 지원(배열 가정이 일반적)
+            if isinstance(data, dict):
+                # dict인 경우 values 펼침
+                for k, v in data.items():
+                    yield v
+            else:
+                for obj in data:
+                    yield obj
+
+# ===== Dataset =====
+class InferenceSet(Dataset):
+    def __init__(self, items, tokenizer, max_len):
+        self.items = items
+        self.tok = tokenizer
+        self.max_len = max_len
+    def __len__(self):
+        return len(self.items)
+    def __getitem__(self, i):
+        obj = self.items[i]
+        payload = obj.get('payload', {}) if isinstance(obj, dict) else {}
+        txt = payload.get('user_input', '')
+        if not isinstance(txt, str):
+            txt = str(txt)
+        # NFKC normalize (이모지/공백 유지)
+        txt = ud.normalize('NFKC', txt)
+        enc = self.tok(txt, truncation=True, padding='max_length', max_length=self.max_len, return_tensors='pt')
+        item = {k: v.squeeze(0) for k,v in enc.items()}
+        return item
+
+# ===== 모델 로드 =====
+print(f"[Load] MODEL_DIR={MODEL_DIR}")
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model.eval()
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+# ===== 데이터 적재 =====
+print(f"[Load] INPUT={INPUT_PATH}")
+items = list(load_items(INPUT_PATH))
+print(f"[Load] total items: {len(items):,}")
+
+# ===== 추론 =====
+ds = InferenceSet(items, tokenizer, MAX_LEN)
+dl = DataLoader(ds, batch_size=BATCH, shuffle=False, num_workers=2, pin_memory=True)
+
+all_preds = []
+all_probs = []
+
+@torch.no_grad()
+def infer_batch(batch):
+    for k in list(batch.keys()):
+        batch[k] = batch[k].to(device, non_blocking=True)
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16) if device.type=='cuda' else torch.no_grad():
+        logits = model(**batch).logits
+        probs = torch.softmax(logits.float(), dim=-1)
+        conf, pred = probs.max(dim=-1)
+        # margin = p_max - p_second
+        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+        margin = sorted_probs[:,0] - sorted_probs[:,1]
+    return pred.cpu().numpy(), conf.cpu().numpy(), margin.cpu().numpy()
+
+for batch in tqdm(dl, total=math.ceil(len(ds)/BATCH)):
+    pred, conf, margin = infer_batch(batch)
+    all_preds.append(pred)
+    all_probs.append(np.stack([conf, margin], axis=1))
+
+pred_ids = np.concatenate(all_preds)
+conf_margin = np.concatenate(all_probs)  # shape [N,2]
+pred_labels = [LABELS[i] for i in pred_ids]
+
+# ===== 결과 병합 =====
+for i, obj in enumerate(items):
+    payload = obj.get('payload', {}) if isinstance(obj, dict) else {}
+    # 기존 emotion은 유지하고, 예측 필드 추가
+    payload['pred_emotion'] = pred_labels[i]
+    payload['pred_conf'] = float(conf_margin[i,0])
+    payload['pred_margin'] = float(conf_margin[i,1])
+    obj['payload'] = payload
+
+# ===== (옵션) 필터링 결과 생성 =====
+if APPLY_FILTER:
+    kept = []
+    for obj in items:
+        p = obj.get('payload', {})
+        if float(p.get('pred_conf', 0.0)) >= CONF_THRES and float(p.get('pred_margin', 0.0)) >= AGREE_MARGIN:
+            kept.append(obj)
+    print(f"[Filter] kept {len(kept):,} / {len(items):,} (conf>={CONF_THRES}, margin>={AGREE_MARGIN})")
+
+# ===== 저장 =====
+# JSON (전체)
+with open(OUTPUT_JSON, 'w', encoding='utf-8') as f:
+    json.dump(items, f, ensure_ascii=False)
+print(f"[Save] {OUTPUT_JSON}")
+
+# CSV 요약 (전체)
+rows = []
+for obj in items:
+    pid = obj.get('id', None)
+    p = obj.get('payload', {})
+    rows.append({
+        'id': pid,
+        'user_input': p.get('user_input',''),
+        'orig_emotion': p.get('emotion', ''),
+        'pred_emotion': p.get('pred_emotion', ''),
+        'pred_conf': p.get('pred_conf', 0.0),
+        'pred_margin': p.get('pred_margin', 0.0),
+    })
+df = pd.DataFrame(rows)
+df.to_csv(OUTPUT_CSV, index=False)
+print(f"[Save] {OUTPUT_CSV}")
+
+# 필터 버전 저장
+if APPLY_FILTER:
+    with open(OUTPUT_JSON_F, 'w', encoding='utf-8') as f:
+        json.dump(kept, f, ensure_ascii=False)
+    print(f"[Save] {OUTPUT_JSON_F}")
+
+    rows_f = []
+    for obj in kept:
+        pid = obj.get('id', None)
+        p = obj.get('payload', {})
+        rows_f.append({
+            'id': pid,
+            'user_input': p.get('user_input',''),
+            'orig_emotion': p.get('emotion', ''),
+            'pred_emotion': p.get('pred_emotion', ''),
+            'pred_conf': p.get('pred_conf', 0.0),
+            'pred_margin': p.get('pred_margin', 0.0),
+        })
+    pd.DataFrame(rows_f).to_csv(OUTPUT_CSV_F, index=False)
+    print(f"[Save] {OUTPUT_CSV_F}")
+
+print("\n Done: pseudo-labels written (pred_emotion/pred_conf/pred_margin)")
