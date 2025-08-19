@@ -7,7 +7,10 @@
 본 모델은 Hugging Face Hub(@Seonghaa)에 업로드되어 있으며, 파이프라인 API로 바로 추론에 활용할 수 있습니다.
 
 ---
+## huggingface
+- https://huggingface.co/Seonghaa/korean-emotion-classifier-roberta
 
+---
 ## ⚙️ 모델 학습 프로세스
 1. **Step 1. KcELECTRA(Simple Training)**  
    - 베이스모델: `beomi/KcELECTRA-base-v2022`  
