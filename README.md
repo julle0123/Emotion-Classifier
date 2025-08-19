@@ -8,7 +8,7 @@
 
 ---
 ## huggingface
-- https://huggingface.co/Seonghaa/korean-emotion-classifier-roberta
+- [korean-emotion-classifier-roberta](https://huggingface.co/Seonghaa/korean-emotion-classifier-roberta)
 
 ---
 ## ⚙️ 모델 학습 프로세스
